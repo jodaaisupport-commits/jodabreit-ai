@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app
+import app_local
 
 
 class AppUtilityTests(unittest.TestCase):
@@ -135,9 +136,41 @@ class AppUtilityTests(unittest.TestCase):
             post.call_args.kwargs["headers"]["Authorization"], "Bearer " + test_key
         )
 
+    def test_ollama_stream_uses_local_endpoint_without_environment_proxies(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def iter_lines(self):
+                yield b'{"message":{"content":"Lokal"}}'
+                yield b'{"done":true}'
+
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = True
+
+            def post(self, url, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return FakeResponse()
+
+        session = FakeSession()
+        with patch("requests.Session", return_value=session):
+            result = list(app_local._ollama_stream([], "llama3.2"))
+
+        self.assertEqual(result, ["Lokal"])
+        self.assertFalse(session.trust_env)
+        self.assertEqual(session.url, "http://127.0.0.1:11434/api/chat")
+
     @unittest.skipUnless(importlib.util.find_spec("gradio"), "Gradio is required")
     def test_build_app(self):
         interface = app.build_app()
+        self.assertIsNotNone(interface)
+        interface.close()
+
+    @unittest.skipUnless(importlib.util.find_spec("gradio"), "Gradio is required")
+    def test_build_local_app(self):
+        interface = app_local.build_app()
         self.assertIsNotNone(interface)
         interface.close()
 
