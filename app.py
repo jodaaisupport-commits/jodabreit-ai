@@ -166,11 +166,19 @@ def _cache_path(digest, mode):
     return CACHE_DIR / f"{digest}_{suffix}.pkl"
 
 
-def _load_pickle(cache_path):
+def _load_pickle(cache_path, kind):
     try:
         with cache_path.open("rb") as file:
             payload = pickle.load(file)
-        if not isinstance(payload, dict) or not isinstance(payload.get("chunks"), list):
+        if (
+            not isinstance(payload, dict)
+            or payload.get("kind") != kind
+            or not isinstance(payload.get("chunks"), list)
+            or not all(isinstance(chunk, str) for chunk in payload["chunks"])
+            or "matrix" not in payload
+            or (kind == "tfidf" and "vectorizer" not in payload)
+            or (kind == "gemini" and not payload.get("embedding_model"))
+        ):
             return None
         return payload
     except Exception:
@@ -226,7 +234,8 @@ def get_index(path, mode):
         return RAGIndex(cached[1]), False
 
     cache_path = _cache_path(digest, mode)
-    payload = _load_pickle(cache_path) if cache_path.exists() else None
+    kind = "tfidf" if mode == "TF-IDF (lokal & schlank)" else "gemini"
+    payload = _load_pickle(cache_path, kind) if cache_path.exists() else None
     created = payload is None
     if created:
         payload = _build_index(path, mode, digest)
@@ -306,6 +315,8 @@ def _groq_stream(messages, model):
     )
     response.raise_for_status()
     for line in response.iter_lines(decode_unicode=True):
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
         if not line or not line.startswith("data:"):
             continue
         data = line[5:].strip()
@@ -410,7 +421,7 @@ def build_app():
             file_types=[".pdf", ".txt"],
             type="filepath",
         )
-        chatbot = gr.Chatbot(type="messages", label="Chat")
+        chatbot = gr.Chatbot(label="Chat")
         message = gr.Textbox(
             label="Nachricht", placeholder="Stelle eine Frage …", lines=2
         )
