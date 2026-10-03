@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import tempfile
 from pathlib import Path
 
@@ -72,6 +73,20 @@ def extract_text(path):
             "Das Dokument enthält keinen lesbaren Text. Bei gescannten PDFs wird OCR benötigt."
         )
     return text
+
+
+def _validate_uploaded_file(path):
+    from gradio.utils import get_upload_folder
+
+    try:
+        path = Path(path).resolve(strict=True)
+        upload_root = Path(get_upload_folder()).resolve()
+        path.relative_to(upload_root)
+    except (OSError, TypeError, ValueError):
+        _raise_gradio_error("Bitte eine gültige hochgeladene PDF- oder TXT-Datei wählen.")
+    if not path.is_file() or path.suffix.lower() not in {".pdf", ".txt"}:
+        _raise_gradio_error("Nicht unterstützter Dateityp. Bitte eine PDF- oder TXT-Datei wählen.")
+    return path
 
 
 def chunk_text(text):
@@ -162,8 +177,11 @@ def _normalize(vectors, np):
 
 
 def _cache_path(digest, mode):
+    if not re.fullmatch(r"[a-f0-9]{16}", digest):
+        raise ValueError("Ungültiger Dokument-Hash.")
     suffix = "tfidf" if mode == "TF-IDF (lokal & schlank)" else "gemini"
-    return CACHE_DIR / f"{digest}_{suffix}.pkl"
+    cache_root = CACHE_DIR.resolve()
+    return cache_root / f"{digest}_{suffix}.pkl"
 
 
 def _load_pickle(cache_path, kind):
@@ -360,6 +378,7 @@ def chat(message, history, provider, model_label, retrieval_mode, document):
     system_prompt = SYSTEM_PROMPT
     citations = []
     if document:
+        document = _validate_uploaded_file(document)
         index, created = get_index(document, retrieval_mode)
         if created:
             import gradio as gr

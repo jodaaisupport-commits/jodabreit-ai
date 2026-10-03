@@ -42,6 +42,10 @@ class AppUtilityTests(unittest.TestCase):
             second.write_text("changed contents", encoding="utf-8")
             self.assertNotEqual(initial, app.file_sha256(second))
 
+    def test_cache_path_rejects_non_hash_names(self):
+        with self.assertRaises(ValueError):
+            app._cache_path("../outside", "TF-IDF (lokal & schlank)")
+
     @unittest.skipUnless(importlib.util.find_spec("sklearn"), "scikit-learn is required")
     def test_index_reuses_disk_cache_for_renamed_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -136,6 +140,22 @@ class AppUtilityTests(unittest.TestCase):
         interface = app.build_app()
         self.assertIsNotNone(interface)
         interface.close()
+
+    @unittest.skipUnless(importlib.util.find_spec("gradio"), "Gradio is required")
+    def test_uploaded_file_path_must_be_within_gradio_upload_dir(self):
+        import gradio as gr
+        from gradio.utils import get_upload_folder
+
+        with tempfile.TemporaryDirectory(dir=get_upload_folder()) as directory:
+            path = Path(directory) / "notes.txt"
+            path.write_text("Uploaded document", encoding="utf-8")
+            self.assertEqual(app._validate_uploaded_file(path), path.resolve())
+
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory) / "notes.txt"
+            outside.write_text("Not uploaded", encoding="utf-8")
+            with self.assertRaises(gr.Error):
+                app._validate_uploaded_file(outside)
 
 
 if __name__ == "__main__":
