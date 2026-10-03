@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import pickle
@@ -53,7 +54,8 @@ def extract_text(path):
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".txt":
-        text = path.read_text(encoding="utf-8", errors="replace")
+        with open(path, encoding="utf-8", errors="replace") as file:
+            text = file.read()
     elif suffix == ".pdf":
         try:
             from pypdf import PdfReader
@@ -75,18 +77,31 @@ def extract_text(path):
     return text
 
 
-def _validate_uploaded_file(path):
-    from gradio.utils import get_upload_folder
-
-    try:
-        path = Path(path).resolve(strict=True)
-        upload_root = Path(get_upload_folder()).resolve()
-        path.relative_to(upload_root)
-    except (OSError, TypeError, ValueError):
-        _raise_gradio_error("Bitte eine gültige hochgeladene PDF- oder TXT-Datei wählen.")
-    if not path.is_file() or path.suffix.lower() not in {".pdf", ".txt"}:
+def _extract_uploaded_text(content, suffix):
+    if not isinstance(suffix, str) or suffix.lower() not in {".pdf", ".txt"}:
         _raise_gradio_error("Nicht unterstützter Dateityp. Bitte eine PDF- oder TXT-Datei wählen.")
-    return path
+    suffix = suffix.lower()
+    if suffix == ".txt":
+        text = content.decode("utf-8", errors="replace")
+    elif suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            _raise_gradio_error("Zum Lesen von PDFs muss pypdf installiert sein.")
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as exc:
+            _raise_gradio_error(f"Das PDF konnte nicht gelesen werden: {exc}")
+    else:
+        _raise_gradio_error("Nicht unterstützter Dateityp. Bitte eine PDF- oder TXT-Datei wählen.")
+
+    text = text.strip()
+    if not text:
+        _raise_gradio_error(
+            "Das Dokument enthält keinen lesbaren Text. Bei gescannten PDFs wird OCR benötigt."
+        )
+    return text
 
 
 def chunk_text(text):
@@ -204,13 +219,17 @@ def _load_pickle(cache_path, kind):
 
 
 def _build_index(path, mode, digest):
-    chunks = chunk_text(extract_text(path))
+    return _build_index_from_text(extract_text(path), mode, digest, Path(path).name)
+
+
+def _build_index_from_text(text, mode, digest, doc_name):
+    chunks = chunk_text(text)
     if not chunks:
         _raise_gradio_error("Im Dokument wurden keine Textabschnitte gefunden.")
 
     payload = {
         "kind": "tfidf" if mode == "TF-IDF (lokal & schlank)" else "gemini",
-        "doc_name": Path(path).name,
+        "doc_name": doc_name,
         "chunks": chunks,
     }
     if payload["kind"] == "tfidf":
@@ -244,9 +263,7 @@ def _build_index(path, mode, digest):
     return payload
 
 
-def get_index(path, mode):
-    digest = file_sha256(path)
-    cache_key = (str(Path(path).resolve()), mode)
+def _get_cached_index(digest, cache_key, mode, doc_name, build):
     cached = _INDEX_CACHE.get(cache_key)
     if cached and cached[0] == digest:
         return RAGIndex(cached[1]), False
@@ -256,12 +273,45 @@ def get_index(path, mode):
     payload = _load_pickle(cache_path, kind) if cache_path.exists() else None
     created = payload is None
     if created:
-        payload = _build_index(path, mode, digest)
+        payload = build()
     else:
-        payload["doc_name"] = Path(path).name
+        payload["doc_name"] = doc_name
 
     _INDEX_CACHE[cache_key] = (digest, payload)
     return RAGIndex(payload), created
+
+
+def get_index(path, mode):
+    digest = file_sha256(path)
+    cache_key = (str(Path(path).resolve()), mode)
+    return _get_cached_index(
+        digest,
+        cache_key,
+        mode,
+        Path(path).name,
+        lambda: _build_index(path, mode, digest),
+    )
+
+
+def get_index_from_bytes(content, suffix, mode):
+    if not isinstance(suffix, str) or suffix.lower() not in {".pdf", ".txt"}:
+        _raise_gradio_error("Nicht unterstützter Dateityp. Bitte eine PDF- oder TXT-Datei wählen.")
+    digest_builder = hashlib.sha256()
+    for offset in range(0, len(content), 1024 * 1024):
+        digest_builder.update(content[offset : offset + 1024 * 1024])
+    digest = digest_builder.hexdigest()[:16]
+    suffix = suffix.lower()
+    doc_name = f"Dokument{suffix}"
+    cache_key = (digest, mode)
+    return _get_cached_index(
+        digest,
+        cache_key,
+        mode,
+        doc_name,
+        lambda: _build_index_from_text(
+            _extract_uploaded_text(content, suffix), mode, digest, doc_name
+        ),
+    )
 
 
 def retrieve(index, query):
@@ -367,7 +417,7 @@ def _gemini_stream(messages, model, system_prompt):
             yield response.text
 
 
-def chat(message, history, provider, model_label, retrieval_mode, document):
+def chat(message, history, provider, model_label, retrieval_mode, document, document_type):
     history = list(history or [])
     messages = [
         {"role": item["role"], "content": item["content"]}
@@ -378,14 +428,13 @@ def chat(message, history, provider, model_label, retrieval_mode, document):
     system_prompt = SYSTEM_PROMPT
     citations = []
     if document:
-        document = _validate_uploaded_file(document)
-        index, created = get_index(document, retrieval_mode)
+        index, created = get_index_from_bytes(document, document_type, retrieval_mode)
         if created:
             import gradio as gr
 
             gr.Info(
                 f"📚 Index erstellt & gespeichert: {len(index.payload['chunks'])} Abschnitte "
-                f"aus „{Path(document).name}“"
+                f"aus „{index.payload['doc_name']}“"
             )
         context, citations = retrieve(index, message)
         system_prompt = _rag_system_prompt(context)
@@ -438,7 +487,10 @@ def build_app():
         document = gr.File(
             label="Dokument (optional, PDF oder TXT)",
             file_types=[".pdf", ".txt"],
-            type="filepath",
+            type="binary",
+        )
+        document_type = gr.Dropdown(
+            choices=[".pdf", ".txt"], value=".pdf", label="Dateityp des Dokuments"
         )
         chatbot = gr.Chatbot(label="Chat")
         message = gr.Textbox(
@@ -455,7 +507,15 @@ def build_app():
         )
         message.submit(
             chat,
-            inputs=[message, chatbot, provider, model, retrieval_mode, document],
+            inputs=[
+                message,
+                chatbot,
+                provider,
+                model,
+                retrieval_mode,
+                document,
+                document_type,
+            ],
             outputs=chatbot,
         ).then(lambda: "", outputs=message)
 

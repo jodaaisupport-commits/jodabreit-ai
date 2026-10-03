@@ -141,21 +141,23 @@ class AppUtilityTests(unittest.TestCase):
         self.assertIsNotNone(interface)
         interface.close()
 
-    @unittest.skipUnless(importlib.util.find_spec("gradio"), "Gradio is required")
-    def test_uploaded_file_path_must_be_within_gradio_upload_dir(self):
-        import gradio as gr
-        from gradio.utils import get_upload_folder
-
-        with tempfile.TemporaryDirectory(dir=get_upload_folder()) as directory:
-            path = Path(directory) / "notes.txt"
-            path.write_text("Uploaded document", encoding="utf-8")
-            self.assertEqual(app._validate_uploaded_file(path), path.resolve())
-
+    @unittest.skipUnless(importlib.util.find_spec("sklearn"), "scikit-learn is required")
+    def test_binary_upload_uses_content_hash_cache(self):
+        content = b"Paris is the capital of France. " * 30
         with tempfile.TemporaryDirectory() as directory:
-            outside = Path(directory) / "notes.txt"
-            outside.write_text("Not uploaded", encoding="utf-8")
-            with self.assertRaises(gr.Error):
-                app._validate_uploaded_file(outside)
+            with patch.object(app, "CACHE_DIR", Path(directory) / ".rag_cache"):
+                app._INDEX_CACHE.clear()
+                index, created = app.get_index_from_bytes(
+                    content, ".txt", "TF-IDF (lokal & schlank)"
+                )
+                app._INDEX_CACHE.clear()
+                reloaded, reindexed = app.get_index_from_bytes(
+                    content, ".txt", "TF-IDF (lokal & schlank)"
+                )
+
+        self.assertTrue(created)
+        self.assertFalse(reindexed)
+        self.assertEqual(index.payload["chunks"], reloaded.payload["chunks"])
 
 
 if __name__ == "__main__":
